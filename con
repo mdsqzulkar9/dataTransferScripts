@@ -1,0 +1,30 @@
+#!/usr/bin/env python
+import sys
+import os
+import time
+
+dns = {'amazon-node2':'ssh -i /Users/mds/Dropbox/gits/amazon_instance_keys/node1.pem ubuntu@ec2-54-91-162-103.compute-1.amazonaws.com',
+       'amazon-node1':'ssh -i /Users/mds/Dropbox/gits/amazon_instance_keys/node1.pem ubuntu@ec2-184-73-118-175.compute-1.amazonaws.com',
+       'amazon-asia1':'ssh -i /Users/mds/Dropbox/gits/amazon_instance_keys/key_amazon_asia.pem ubuntu@ec2-54-255-228-135.ap-southeast-1.compute.amazonaws.com',
+       'amazon-asia2':'ssh -i /Users/mds/Dropbox/gits/amazon_instance_keys/key_amazon_asia.pem ubuntu@ec2-54-255-225-155.ap-southeast-1.compute.amazonaws.com'}
+
+
+if len(sys.argv) == 2 :     
+
+    server_key = sys.argv[1]
+
+    
+    
+    if server_key == '-help':
+        print_help()
+
+    else: # Connect to server
+        if server_key in dns.keys():
+            print('Server key is valid ...')
+            print("We are trying to connect"+server_key)
+            os.system(dns[server_key])
+
+
+        else:
+            print('Invalid server id')
+        

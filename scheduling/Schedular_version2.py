@@ -1,0 +1,397 @@
+
+# coding: utf-8
+
+# In[1]:
+
+# This schedular performs sample transfers for small files. 
+# then it performs gets the local maxima from the throughput curve.
+
+
+# # Pre-requisite:
+'''
+Things you need to do before running this script. 
+    + Obviously choose to node with gridftp server working.
+    + Check whether globus-url-copy is working or not. 
+    + Run gloubus-gridftp-sever with port in anonymous mode, or just do module load on XSEDE.
+    + You can use different ports in source and destination, however, use same port number for this script.
+    + Then run FileGenSimple.py to create the dataset or choose a dataset to transfer.
+    + Update the variables accordingly. Be consistant with FileGenSimple.py parameters. 
+    + Measure RTT and bandwidth of the link, you might need those information in variable section. 
+'''    
+# # Libraries:
+
+# In[2]:
+
+import os
+import random
+import sys, time
+import datetime
+import math
+import logging
+import threading
+import pandas as pd
+import itertools
+from threading import Thread
+import pandas as pd
+
+
+# # Variables:
+# 
+
+# In[3]:
+
+# Feel free to update those variable. If you know 
+# what you are doing! :-)
+
+# Script mode:
+# There are couple of modes that you can set.
+# "experiment" - it will perform experiments with     
+mode = "experiment"
+
+if mode == "experiment":
+    ######### VARIABLES WE WANT YOU TO SET. ######################
+    exp_name = "exp_test"
+    transfer_type = ['I','C']  # I - individual transfer, small or large files, 
+                               # C - small and large file xfer concurrently.
+    number_of_groups = 2   # how many file types you wanna transfer as contending requests.
+    small_folder = 'sample_1_0'
+    large_folder = 'sample_3_0'
+    param_samples = [5, 10, 15, 20, 25] # uniform sampling of parameters
+    fixed_pp = 32
+    times = 5   # number of times you wanna do the transfers. 5 means it will transfer a request 
+                # 5 times consequitively.
+        
+    log_directory = '/home/zulkar/logs/'
+    # Columns in the log:
+    # columns = ['exp_name','xfer_id','type','file_size','#files',
+    #           'bandwidth','rtt','buffer_size','p','cc','pp','throughput',
+    #          'time', 'source','destination']
+    # exp_log = pd.DataFrame(columns=columns)
+    
+    
+    
+
+# node information: 
+source = 'evenstar.cse.buffalo.edu'
+destination = 'didclab-ws10.cse.buffalo.edu'
+port = 50000
+source_path = "/home/zulkar/dataset/first_one/"
+destination_path = "/home/zulkar/received/"
+
+
+    
+
+# Network information: 
+bandwidth = 1  # Gbps
+rtt = 0.2   # ms
+tcp_bs = 25600
+# Dataset information:
+# group range is a dictionary with key as group names:
+# group means file size range e.g. small, medium, large 
+# value of this dictionary is a list:
+#      first element : lowest filesize
+#      second element : hight filesize
+#      third element : number of files
+#      fourth element : sample folders
+group_range = {'1':[1,40,100,10],'2':[100,600,50,4],'3':[900,10000,10,10]}
+ind_low  = 0
+ind_high = 1
+ind_n = 2
+ind_samples = 3
+
+
+#################### Derived variables : Don't Set those ! ################
+full_source = "file://" + source_path  + "/"
+full_destination = 'ftp://' + destination + ":" + str(port) + destination_path
+
+buffer_size = int((bandwidth*1024*rtt*1000)/8)
+
+
+######################################################################
+
+print("source node: ", source)
+print("destination node: ", destination)
+print("control port: ", port, " This port is same to both source and destination, just to make life easy")
+print("dataset path in source: ", source_path)
+print("destination path: ", destination_path)
+print("link bandwidth: ", bandwidth)
+print("rtt: ", rtt)
+print("buffer size: ", buffer_size)
+
+
+# # Methods:
+
+# In[4]:
+
+def generate_param_combinations(params,stype='single'):
+    """ This generates all the permutations of parameter settings. 
+        Attribute : params - this is the sample list of parameters. 
+                    stype  - can have two values 'single' or 'concurrent'
+                    
+        returns - list [(small_p, small_cc), (large_p, large_cc)] when stype='concurrent'
+        returns - list [(p, cc)] when stype = 'single'.
+        """
+    single_list = [] # param combinations for single transfers.
+    for permut in itertools.permutations(params, 2):
+        single_list.append(permut)
+    
+    if stype == 'single':
+        return single_list
+    elif stype == 'concurrent':
+        con_list = []
+        for permut_c in itertools.permutations(single_list, 2):
+            #print(subset3)
+            con_list.append(permut_c)
+        return con_list
+
+
+# In[5]:
+
+def get_folder_size(folder):
+    """ This function takes full path of a folder as input
+        Returns size of whole folder in (bytes)
+    """
+    total_size = os.path.getsize(folder)
+    for item in os.listdir(folder):
+        itempath = os.path.join(folder, item)
+        if os.path.isfile(itempath):
+            total_size += os.path.getsize(itempath)
+        elif os.path.isdir(itempath):
+            total_size += getFolderSize(itempath)
+    return total_size # bytes
+
+
+# In[6]:
+
+def get_file_info(folder):
+    """This function computes total number of files and total file size.
+    input: folder - a full valid path
+    output : total_files, total_size
+    """
+    total_size = os.path.getsize(folder)
+    for item in os.listdir(folder):
+        itempath = os.path.join(folder, item)
+        if os.path.isfile(itempath):
+            total_size += os.path.getsize(itempath)
+        elif os.path.isdir(itempath):
+            total_size += getFolderSize(itempath)
+    print("Total size of directory: ", total_size, "Bytes")        
+    total_files = 0
+    for root, dirs, files in os.walk(folder):
+        total_files += len(files)
+    print("Total files: ", total_files)
+    return total_files, total_size # bytes
+    
+    
+
+
+# In[7]:
+
+def experiment():
+    """ Perform data transfer experiments. In this experiment, we will discover the effect of concurrent transfers.
+    In this experiment, we group data in to two file size groups - small - large. We will see how this transfers 
+    are doing under same background traffic. Assumption is data transfer didn't experience background traffic between 
+    1 or 2 hours. First transfer a small file, then transfer a large file, then transfer them concurrently. """
+    
+    #from multiprocessing.pool import ThreadPool
+    #pool = ThreadPool(processes=4)
+    
+    
+    # make all the permutations of parameter combinations for concurrent transfers.
+    all_permuts = generate_param_combinations(param_samples,stype='concurrent')  
+    
+    # create the source folder path :
+    small_path_src = source_path + small_folder + '/'
+    large_path_src = source_path + large_folder + '/'
+    print("small path src:", small_path_src)
+    # create the destination folder path :
+    small_path_dst = destination_path + small_folder + '/'
+    large_path_dst = destination_path + large_folder + '/'
+    
+    # full url of the source and destination folders:
+    full_small_src = "file://" + small_path_src  
+    full_large_src = "file://" + large_path_src  
+    
+    full_small_dest = 'ftp://' + destination + ":" + str(port) + small_path_dst
+    full_large_dest = 'ftp://' + destination + ":" + str(port) + large_path_dst
+    
+    # columns = ['exp_name','xfer_id','type','file_size','#files',
+    #           'bandwidth','rtt','buffer_size','p','cc','pp','throughput',
+    #          'time', 'source','destination']
+    
+   
+    # list of logs where each log entry is a dictionary.
+    logs = []
+    
+    
+        
+    for idx, permut in enumerate(all_permuts):
+        small_p = permut[0][0]
+        small_cc = permut[0][1]
+        small_pp = fixed_pp
+        
+        large_p = permut[1][0]
+        large_cc = permut[1][1]
+        large_pp = fixed_pp
+        
+        # perform small transfer:
+        small_only_result = {'throughput':0.0}
+        num_s,size_s = get_file_info(small_path_src)
+        perform_transfer(full_small_src, full_small_dest, small_only_result, size_s, small_p, small_cc, 
+                                                small_pp, True, tcp_bs,True)
+        
+        small_only_th = small_only_result['throughput']
+        
+        
+        log = log_gen(exp_name = exp_name, transfer_id= idx,etype = 'I', file_size = size_s,
+                num_files = num_s, bandwidth = bandwidth, rtt = rtt, tcp_bs = tcp_bs, p = small_p, cc = small_cc,
+                pp = small_pp, throughput = small_only_th, source=source, destination=destination )
+        
+        logs.append(log)
+        
+        
+        # perform large transfer:
+        large_only_result = {'throughput':0.0}
+        num_l,size_l = get_file_info(large_path_src)
+        perform_transfer(full_large_src, full_large_dest, large_only_result, size_l, large_p, large_cc, 
+                                                large_pp, True, tcp_bs,True)
+        
+        large_only_th = large_only_result['throughput']
+        
+        
+        log = log_gen(exp_name = exp_name, transfer_id= idx,etype = 'I', file_size = size_l,
+                num_files = num_l, bandwidth = bandwidth, rtt = rtt, tcp_bs = tcp_bs, p = large_p, cc = large_cc,
+                pp = large_pp, throughput = large_only_th, source=source, destination=destination )
+        
+        logs.append(log)
+        
+        
+        # perform small and large transfer:
+        small_combine_result = {'throughput':0.0}
+        large_combine_result = {'throughput':0.0}
+        t1 = Thread(target=perform_transfer, args=(full_small_src, full_small_dest,small_combine_result, 
+                                        size_s, small_p, small_cc, small_pp, True, tcp_bs,False))
+        
+        t2 = Thread(target=perform_transfer, args=(full_large_src, full_large_dest, large_only_result,
+                                        size_l, large_p, large_cc, large_pp, True, tcp_bs,False))
+
+        t1.start()
+        t2.start()
+
+        t1.join()
+        t2.join()
+
+        small_combine_th = small_combine_result['throughput']
+        large_combine_th = large_combine_result['throughput']
+        
+        log_s = log_gen(exp_name = exp_name, transfer_id= idx,etype = 'C', file_size = size_s,
+                num_files = num_s , bandwidth = bandwidth, rtt = rtt, tcp_bs = tcp_bs, p = large_p, cc = large_cc,
+                pp = large_pp, throughput = small_combine_th, source=source, destination=destination )
+        
+        logs.append(log_s)
+        
+        log_l = log_gen(exp_name = exp_name, transfer_id= idx,etype = 'C', file_size = size_l,
+                num_files = num_l , bandwidth = bandwidth, rtt = rtt, tcp_bs = tcp_bs, p = large_p, cc = large_cc,
+                pp = large_pp, throughput = large_combine_th, source=source, destination=destination )
+        
+        logs.append(log_l)
+        
+        # write log to a file: 
+        temp_log = pd.DataFrame(logs)
+        
+        temp_log_file_name_pkl = 'exp_' + exp_name + '_id_' + str(idx) + '.pkl'
+        temp_log_file_name_csv = 'exp_' + exp_name + '_id_' + str(idx) + '.csv'
+        full_temp_log_path_pkl = log_directory + temp_log_file_name_pkl
+        full_temp_log_path_csv = log_directory + temp_log_file_name_csv
+        temp_log.to_csv(full_temp_log_path_csv)
+        temp_log.to_pickle(full_temp_log_path_pkl)
+    return logs
+        
+
+
+# In[12]:
+
+def perform_transfer(source, destination, result,size, p , cc, pp, fast, tcp_bs,print_flag):
+    """To do a transfer you need to provide:
+            source 
+            destination
+            p
+            cc
+            pp
+            fast
+            tcp-bs
+       performs the transfer and returns 
+           throughput
+           time
+    """
+    space = " "
+    globus_cmd = "globus-url-copy" +                     space + "-tcp-bs" + space + str(tcp_bs) +                     space + "-p" + space + str(p) +                     space + "-cc" + space + str(cc) +                     space + "-ppq" + space + str(pp) +                     space + source +                     space + destination
+    globus_cmd 
+    if print_flag:
+        print("started data transfer: ")
+        print("globus command:",globus_cmd)
+    
+    
+    transfer_start_time = time.time()
+    #os.system(globus_cmd)
+    transfer_finish_time = time.time()  # in seconds
+    
+    time_required = transfer_finish_time - transfer_start_time 
+    
+    bytes_xfered = size
+    
+    if int(time_required) != 0 :
+        throughput = ( bytes_xfered *8) / (time_required * 1024 * 1024 )     # in Giga bit per seconds
+    
+    else:
+        throughput = -1
+    
+    result['throughput'] = throughput
+    
+    
+    
+
+
+# In[13]:
+
+def log_gen(exp_name = 'default', transfer_id= 0,etype = 'I', file_size = 0,
+                num_files = 0, bandwidth = 0, rtt = 0, tcp_bs = 0, p = 0, cc = 0,
+                pp = 0, throughput = 0, source='default', destination='default' ):
+        
+        log_dict = {}
+        log_dict['exp_id'] = exp_name
+        log_dict['transfer_id'] = transfer_id
+        log_dict['type'] = etype
+    
+        log_dict['file_size'] = file_size
+        log_dict['num_files'] = num_files
+        log_dict['bandwidth'] = bandwidth
+        log_dict['rtt'] = rtt
+        log_dict['tcp_bs'] = tcp_bs
+        log_dict['p'] = p
+        log_dict['cc'] = cc
+        log_dict['pp'] = pp
+        log_dict['throughput'] = throughput
+        log_dict['source'] = source 
+        log_dict['destination'] = destination
+        
+        return log_dict
+
+
+# In[14]:
+
+dict_log = experiment()
+
+
+# In[15]:
+
+data_log = pd.DataFrame(dict_log)
+# write log to a file: 
+data_log = pd.DataFrame(dict_log)
+
+log_file_name_pkl = 'exp_' + exp_name + '.pkl'
+log_file_name_csv = 'exp_' + exp_name + '.csv'
+full_log_path_pkl = log_directory + log_file_name_pkl
+full_log_path_csv = log_directory + log_file_name_csv
+data_log.to_csv(full_log_path_csv)
+data_log.to_pickle(full_log_path_pkl)
